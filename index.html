@@ -243,6 +243,12 @@
         const auth = firebase.auth();
         const db = firebase.firestore();
         
+        // Configuración para forzar HTTP Long-Polling y mitigar fallos de WebSocket en redes móviles o restringidas
+        db.settings({
+            experimentalForceLongPolling: true,
+            useFetchStreams: false
+        });
+        
         let sessionListener = null;
         let localSessionToken = null;
         let isReleasingSession = false;
@@ -261,7 +267,7 @@
                     if (doc.exists) {
                         const data = doc.data();
                         
-                        // Bloqueo: El primero que entra bloquea al segundo
+                        // Bloqueo estricto: El primer dispositivo conectado bloquea el acceso de otros
                         if (data && data.activeSession === true && data.sessionToken !== localSessionToken) {
                             errorDiv.innerText = "Error de Concurrencia: Ya existe una sesión activa en uso en otro terminal.";
                             errorDiv.classList.remove('hidden');
@@ -272,12 +278,12 @@
                         }
                     }
                     
-                    // Si no hay bloqueo, generamos nuestro token único de sesión local
+                    // Si el token local aún no está inicializado, se le asigna la estampa de tiempo actual
                     if (!localSessionToken) {
                         localSessionToken = Date.now().toString();
                     }
                     
-                    // Bloqueamos la sesión en base de datos
+                    // Se consolida el bloqueo marcando la sesión como activa
                     await userRef.set({ 
                         activeSession: true, 
                         sessionToken: localSessionToken 
@@ -288,7 +294,7 @@
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
                     
-                    // Listener en tiempo real: Detecta si la sesión fue purgada externamente
+                    // Listener para reaccionar inmediatamente en tiempo real ante una purga externa
                     sessionListener = userRef.onSnapshot((docSnapshot) => {
                         if (docSnapshot.exists) {
                             const latestData = docSnapshot.data();
@@ -337,7 +343,7 @@
                 const userRef = db.collection('users').doc(auth.currentUser.uid);
                 isReleasingSession = true;
                 try {
-                    // Liberamos la sesión limpiando el estado activo y el token
+                    // Libera la ranura activa en Firestore al cerrar sesión formalmente
                     await userRef.update({
                         activeSession: false,
                         sessionToken: null
@@ -350,7 +356,7 @@
             auth.signOut();
         }
 
-        // Intento de liberación del bloqueo al cerrar la pestaña o el navegador de forma repentina
+        // Intento preventivo de liberación de sesión si se cierra la pestaña
         window.addEventListener('beforeunload', () => {
             if (auth.currentUser && localSessionToken && !isReleasingSession) {
                 db.collection('users').doc(auth.currentUser.uid).update({
@@ -507,4 +513,3 @@
     </script>
 </body>
 </html>
-
