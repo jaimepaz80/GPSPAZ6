@@ -9,7 +9,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -241,48 +240,54 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const db = firebase.firestore();
         
-        let sessionListener = null;
         let localSessionToken = null;
+        let isReleasingSession = false;
 
-        auth.onAuthStateChanged((user) => {
+        auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
+            const errorDiv = document.getElementById('login-error');
             
             if (user) {
-                loginContainer.classList.add('hidden');
-                appContainer.classList.remove('hidden');
-                document.getElementById('login-error').innerText = "";
-                document.getElementById('login-form').reset();
+                if (isReleasingSession) return;
                 
-                // Generar token único para esta instancia (estampa de tiempo milisegundos)
-                localSessionToken = Date.now().toString();
-                const userRef = db.collection('users').doc(user.uid);
-                
-                // Registrar sesión en Firestore
-                userRef.set({ sessionToken: localSessionToken }, { merge: true });
-                
-                // Activar Listener de concurrencia en tiempo real
-                sessionListener = userRef.onSnapshot((doc) => {
-                    if (doc.exists) {
-                        const data = doc.data();
-                        if (data.sessionToken && data.sessionToken !== localSessionToken) {
-                            // Asimetría detectada: Otro operador ingresó con esta credencial
-                            auth.signOut();
-                            alert("Sesión finalizada: Se detectó otro inicio de sesión con esta cuenta geodésica.");
-                        }
+                if (!localSessionToken) {
+                    localSessionToken = Date.now().toString();
+                }
+
+                try {
+                    // Verificación en Python por HTTPS estándar (Libre de problemas WebSocket)
+                    const response = await fetch('/API/session/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid: user.uid, token: localSessionToken })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result && result.allowed === true) {
+                        loginContainer.classList.add('hidden');
+                        appContainer.classList.remove('hidden');
+                        errorDiv.innerText = "";
+                        document.getElementById('login-form').reset();
+                    } else {
+                        errorDiv.innerText = "Error de Concurrencia: Ya existe una sesión activa en uso en otro dispositivo.";
+                        errorDiv.classList.remove('hidden');
+                        isReleasingSession = true;
+                        await auth.signOut();
+                        isReleasingSession = false;
                     }
-                });
+                } catch (error) {
+                    errorDiv.innerText = "Fallo de conexión con el servidor: " + error.message;
+                    errorDiv.classList.remove('hidden');
+                    isReleasingSession = true;
+                    await auth.signOut();
+                    isReleasingSession = false;
+                }
             } else {
                 appContainer.classList.add('hidden');
                 loginContainer.classList.remove('hidden');
-                
-                // Purga de memoria: Destruir el Listener si se cierra la sesión
-                if (sessionListener) {
-                    sessionListener(); 
-                    sessionListener = null;
-                }
                 localSessionToken = null;
             }
         });
@@ -302,9 +307,30 @@
             }
         }
 
-        function cerrarSesion() {
+        async function cerrarSesion() {
+            if (auth.currentUser) {
+                isReleasingSession = true;
+                try {
+                    // Mandar petición al backend de Python para liberar el bloqueo permanentemente
+                    await fetch('/API/session/logout', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ uid: auth.currentUser.uid })
+                    });
+                } catch (error) {
+                    console.error("Error al liberar la sesión en el servidor:", error);
+                }
+                isReleasingSession = false;
+            }
             auth.signOut();
         }
+
+        // Intento preventivo de liberación al cerrar la pestaña repentinamente
+        window.addEventListener('beforeunload', () => {
+            if (auth.currentUser && localSessionToken && !isReleasingSession) {
+                navigator.sendBeacon('/API/session/logout', JSON.stringify({ uid: auth.currentUser.uid }));
+            }
+        });
 
         function switchTab(num) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -453,3 +479,4 @@
     </script>
 </body>
 </html>
+
