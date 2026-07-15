@@ -243,78 +243,42 @@
         const auth = firebase.auth();
         const db = firebase.firestore();
         
-        // Configuración para forzar HTTP Long-Polling y mitigar fallos de WebSocket en redes móviles o restringidas
-        db.settings({
-            experimentalForceLongPolling: true,
-            useFetchStreams: false
-        });
-        
         let sessionListener = null;
         let localSessionToken = null;
-        let isReleasingSession = false;
 
-        auth.onAuthStateChanged(async (user) => {
+        auth.onAuthStateChanged((user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
-            const errorDiv = document.getElementById('login-error');
             
             if (user) {
-                if (isReleasingSession) return;
+                loginContainer.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+                document.getElementById('login-error').innerText = "";
+                document.getElementById('login-form').reset();
                 
+                // Generar token único para esta instancia (estampa de tiempo milisegundos)
+                localSessionToken = Date.now().toString();
                 const userRef = db.collection('users').doc(user.uid);
-                try {
-                    const doc = await userRef.get();
+                
+                // Registrar sesión en Firestore
+                userRef.set({ sessionToken: localSessionToken }, { merge: true });
+                
+                // Activar Listener de concurrencia en tiempo real
+                sessionListener = userRef.onSnapshot((doc) => {
                     if (doc.exists) {
                         const data = doc.data();
-                        
-                        // Bloqueo estricto: El primer dispositivo conectado bloquea el acceso de otros
-                        if (data && data.activeSession === true && data.sessionToken !== localSessionToken) {
-                            errorDiv.innerText = "Error de Concurrencia: Ya existe una sesión activa en uso en otro terminal.";
-                            errorDiv.classList.remove('hidden');
-                            isReleasingSession = true;
-                            await auth.signOut();
-                            isReleasingSession = false;
-                            return;
+                        if (data.sessionToken && data.sessionToken !== localSessionToken) {
+                            // Asimetría detectada: Otro operador ingresó con esta credencial
+                            auth.signOut();
+                            alert("Sesión finalizada: Se detectó otro inicio de sesión con esta cuenta geodésica.");
                         }
                     }
-                    
-                    // Si el token local aún no está inicializado, se le asigna la estampa de tiempo actual
-                    if (!localSessionToken) {
-                        localSessionToken = Date.now().toString();
-                    }
-                    
-                    // Se consolida el bloqueo marcando la sesión como activa
-                    await userRef.set({ 
-                        activeSession: true, 
-                        sessionToken: localSessionToken 
-                    }, { merge: true });
-                    
-                    loginContainer.classList.add('hidden');
-                    appContainer.classList.remove('hidden');
-                    errorDiv.innerText = "";
-                    document.getElementById('login-form').reset();
-                    
-                    // Listener para reaccionar inmediatamente en tiempo real ante una purga externa
-                    sessionListener = userRef.onSnapshot((docSnapshot) => {
-                        if (docSnapshot.exists) {
-                            const latestData = docSnapshot.data();
-                            if (latestData && latestData.sessionToken !== localSessionToken) {
-                                auth.signOut();
-                                alert("Su sesión ha finalizado debido a una reestructuración o limpieza de sesión.");
-                            }
-                        }
-                    });
-                } catch (error) {
-                    errorDiv.innerText = "Fallo de validación de seguridad: " + error.message;
-                    errorDiv.classList.remove('hidden');
-                    isReleasingSession = true;
-                    await auth.signOut();
-                    isReleasingSession = false;
-                }
+                });
             } else {
                 appContainer.classList.add('hidden');
                 loginContainer.classList.remove('hidden');
                 
+                // Purga de memoria: Destruir el Listener si se cierra la sesión
                 if (sessionListener) {
                     sessionListener(); 
                     sessionListener = null;
@@ -338,33 +302,9 @@
             }
         }
 
-        async function cerrarSesion() {
-            if (auth.currentUser) {
-                const userRef = db.collection('users').doc(auth.currentUser.uid);
-                isReleasingSession = true;
-                try {
-                    // Libera la ranura activa en Firestore al cerrar sesión formalmente
-                    await userRef.update({
-                        activeSession: false,
-                        sessionToken: null
-                    });
-                } catch (error) {
-                    console.error("Error al limpiar el estado activo en Firestore: ", error);
-                }
-                isReleasingSession = false;
-            }
+        function cerrarSesion() {
             auth.signOut();
         }
-
-        // Intento preventivo de liberación de sesión si se cierra la pestaña
-        window.addEventListener('beforeunload', () => {
-            if (auth.currentUser && localSessionToken && !isReleasingSession) {
-                db.collection('users').doc(auth.currentUser.uid).update({
-                    activeSession: false,
-                    sessionToken: null
-                });
-            }
-        });
 
         function switchTab(num) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
