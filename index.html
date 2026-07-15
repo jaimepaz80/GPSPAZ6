@@ -9,6 +9,7 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -240,50 +241,57 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
+        const db = firebase.firestore();
+        
+        // 1. SOLUCIÓN AL ERROR "CLIENT IS OFFLINE": Forzar HTTP Long-Polling en lugar de WebSockets
+        db.settings({
+            experimentalForceLongPolling: true,
+            useFetchStreams: false
+        });
         
         let localSessionToken = null;
-        let isReleasingSession = false;
 
+        // 2. LÓGICA ESTRICTA: El primero que inicia sesión bloquea a los demás dispositivos permanentemente
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
             const errorDiv = document.getElementById('login-error');
             
             if (user) {
-                if (isReleasingSession) return;
-                
-                if (!localSessionToken) {
-                    localSessionToken = Date.now().toString();
-                }
-
+                const userRef = db.collection('users').doc(user.uid);
                 try {
-                    // Verificación en Python por HTTPS estándar (Libre de problemas WebSocket)
-                    const response = await fetch('/API/session/login', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ uid: user.uid, token: localSessionToken })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (result && result.allowed === true) {
-                        loginContainer.classList.add('hidden');
-                        appContainer.classList.remove('hidden');
-                        errorDiv.innerText = "";
-                        document.getElementById('login-form').reset();
-                    } else {
-                        errorDiv.innerText = "Error de Concurrencia: Ya existe una sesión activa en uso en otro dispositivo.";
-                        errorDiv.classList.remove('hidden');
-                        isReleasingSession = true;
-                        await auth.signOut();
-                        isReleasingSession = false;
+                    const doc = await userRef.get();
+                    if (doc.exists) {
+                        const data = doc.data();
+                        
+                        // Bloqueo estricto: Si activeSession está activo y el token de sesión es diferente al nuestro, deniega el acceso
+                        if (data.activeSession === true && data.sessionToken !== localSessionToken) {
+                            errorDiv.innerText = "Acceso Denegado: Esta cuenta ya está activa en otro terminal. Cierra sesión en el otro equipo primero.";
+                            errorDiv.classList.remove('hidden');
+                            await auth.signOut();
+                            return;
+                        }
                     }
+                    
+                    if (!localSessionToken) {
+                        localSessionToken = Date.now().toString();
+                    }
+                    
+                    // Bloquea la sesión de forma exclusiva
+                    await userRef.set({ 
+                        activeSession: true, 
+                        sessionToken: localSessionToken 
+                    }, { merge: true });
+                    
+                    loginContainer.classList.add('hidden');
+                    appContainer.classList.remove('hidden');
+                    errorDiv.innerText = "";
+                    document.getElementById('login-form').reset();
+                    
                 } catch (error) {
-                    errorDiv.innerText = "Fallo de conexión con el servidor: " + error.message;
+                    errorDiv.innerText = "Fallo de conexión a la base de datos: " + error.message;
                     errorDiv.classList.remove('hidden');
-                    isReleasingSession = true;
                     await auth.signOut();
-                    isReleasingSession = false;
                 }
             } else {
                 appContainer.classList.add('hidden');
@@ -309,28 +317,19 @@
 
         async function cerrarSesion() {
             if (auth.currentUser) {
-                isReleasingSession = true;
+                const userRef = db.collection('users').doc(auth.currentUser.uid);
                 try {
-                    // Mandar petición al backend de Python para liberar el bloqueo permanentemente
-                    await fetch('/API/session/logout', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ uid: auth.currentUser.uid })
+                    // Libera de forma explícita el indicador de sesión activa
+                    await userRef.update({
+                        activeSession: false,
+                        sessionToken: null
                     });
                 } catch (error) {
-                    console.error("Error al liberar la sesión en el servidor:", error);
+                    console.error("Error al liberar sesión:", error);
                 }
-                isReleasingSession = false;
             }
             auth.signOut();
         }
-
-        // Intento preventivo de liberación al cerrar la pestaña repentinamente
-        window.addEventListener('beforeunload', () => {
-            if (auth.currentUser && localSessionToken && !isReleasingSession) {
-                navigator.sendBeacon('/API/session/logout', JSON.stringify({ uid: auth.currentUser.uid }));
-            }
-        });
 
         function switchTab(num) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -479,4 +478,3 @@
     </script>
 </body>
 </html>
-
