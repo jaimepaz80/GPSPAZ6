@@ -522,6 +522,33 @@
                 alert("Ocurrió un error al generar el PDF. Revisa la consola del navegador.");
             }
         }
+
+        // --- NUEVO MÓDULO DE LIBERACIÓN DE SESIÓN (PREVENCIÓN DE BLOQUEO PERMANENTE) ---
+        window.addEventListener('beforeunload', (event) => {
+            if (auth.currentUser) {
+                // Recupera el token en caché sin forzar recarga HTTP
+                auth.currentUser.getIdToken(false).then(idToken => {
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
+                    const payload = {
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: false },
+                            sessionToken: { stringValue: "" }
+                        }
+                    };
+                    // El parámetro keepalive garantiza que Vercel/Firebase reciba el PATCH aunque el navegador se cierre abruptamente.
+                    fetch(docUrl, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload),
+                        keepalive: true
+                    }).catch(() => {});
+                }).catch(() => {});
+            }
+        });
     </script>
 </body>
 </html>
