@@ -239,15 +239,16 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
+        const firestoreProjectId = firebaseConfig.projectId;
         
-        // Identificador único de este navegador. 
-        // Permite saber si "quien entra" es el mismo dispositivo de la sesión activa o uno ajeno.
+        // Genera un identificador único local del navegador. Si entras desde otro lado, este código será distinto.
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
+        // SISTEMA DE CONTROL DE SESIÓN VÍA API REST PURA
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
@@ -255,46 +256,53 @@
             
             if (user) {
                 try {
-                    // Generamos Token de Autorización de Firebase
                     const idToken = await user.getIdToken();
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
                     
-                    // URL de la API REST oficial de Google Firestore para consultar al usuario
-                    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${user.uid}`;
-                    
-                    // 1. LEER EL ESTADO ACTUAL DE LA BASE DE DATOS
-                    const getResponse = await fetch(url, {
+                    // PASO 1: LEER EL ESTADO ACTUAL DE FORMA SEGURA (HTTP NORMAL)
+                    const getRes = await fetch(docUrl, {
                         method: 'GET',
                         headers: { 'Authorization': `Bearer ${idToken}` }
                     });
 
                     let activeSession = false;
                     let dbToken = "";
+                    let docExists = false;
 
-                    if (getResponse.ok) {
-                        const data = await getResponse.json();
+                    if (getRes.ok) {
+                        docExists = true;
+                        const data = await getRes.json();
                         activeSession = data.fields?.activeSession?.booleanValue || false;
                         dbToken = data.fields?.sessionToken?.stringValue || "";
-                    } 
+                    } else if (getRes.status !== 404) {
+                        const errText = await getRes.text();
+                        throw new Error(`Fallo de lectura de base de datos (${getRes.status}): ${errText}`);
+                    }
                     
-                    // 2. APLICAR SU REGLA: Si la sesión está activa y NO eres el mismo dispositivo, BLOQUEO DEFINITIVO
+                    // PASO 2: APLICACIÓN DE SU REGLA ESTRICTA DE BLOQUEO
                     if (activeSession === true && dbToken !== localToken) {
-                        errorDiv.innerText = "ACCESO DENEGADO: El usuario está en uso en otro dispositivo. El operador activo debe cerrar sesión para liberar la cuenta.";
+                        errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está abierto en otra computadora, teléfono o tablet. Debe cerrar sesión allí primero para poder ingresar.";
                         errorDiv.classList.remove('hidden');
                         await auth.signOut();
-                        return; // Expulsado
+                        return; // Expulsión inmediata
                     }
 
-                    // 3. SI EL ACCESO ES PERMITIDO, SOBREESCRIBIR LA BASE DE DATOS (UPSERT)
-                    // Actualizamos para decirle al sistema "Yo estoy activo ahora y este es mi identificador"
+                    // PASO 3: ASEGURAR Y BLOQUEAR LA CUENTA PARA QUE NADIE MÁS ENTRE
+                    let patchUrl = docUrl;
+                    if (docExists) {
+                        // Si el documento ya existe, usamos updateMask para NO borrar su lista de teléfonos
+                        patchUrl += "?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken";
+                    }
+
                     const payload = {
-                        name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${user.uid}`,
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`,
                         fields: {
                             activeSession: { booleanValue: true },
                             sessionToken: { stringValue: localToken }
                         }
                     };
 
-                    const patchResponse = await fetch(url, {
+                    const patchRes = await fetch(patchUrl, {
                         method: 'PATCH',
                         headers: {
                             'Authorization': `Bearer ${idToken}`,
@@ -303,18 +311,19 @@
                         body: JSON.stringify(payload)
                     });
 
-                    if (!patchResponse.ok) {
-                        throw new Error("No se pudo escribir en Firestore.");
+                    if (!patchRes.ok) {
+                        const errText = await patchRes.text();
+                        throw new Error(`El sistema protegió su cuenta y rechazó la sobre-escritura (${patchRes.status}): ${errText}`);
                     }
 
-                    // Éxito: Mostrar Aplicación
+                    // PASO 4: ACCESO CONCEDIDO CON ÉXITO
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
                     
                 } catch (error) {
-                    errorDiv.innerText = "Error crítico de conexión segura: " + error.message;
+                    errorDiv.innerText = "Error en el protocolo de seguridad: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
@@ -334,7 +343,7 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Credenciales incorrectas: " + error.message;
+                errorDiv.innerText = "Error de ingreso: " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
@@ -342,19 +351,19 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // Al presionar el botón, liberamos la base de datos para que el usuario B sí pueda entrar
+                    // Solo cuando hace clic aquí, el sistema libera su cuenta para que otro dispositivo entre
                     const idToken = await auth.currentUser.getIdToken();
-                    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${auth.currentUser.uid}`;
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
                     
                     const payload = {
-                        name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
                         fields: {
                             activeSession: { booleanValue: false },
                             sessionToken: { stringValue: "" }
                         }
                     };
 
-                    await fetch(url, {
+                    await fetch(docUrl, {
                         method: 'PATCH',
                         headers: {
                             'Authorization': `Bearer ${idToken}`,
@@ -516,4 +525,3 @@
     </script>
 </body>
 </html>
-
