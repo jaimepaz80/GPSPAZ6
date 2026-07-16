@@ -7,9 +7,10 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     
-    <!-- SDK de Firebase: Solo App y Auth. Firestore se maneja vía REST API pura para evadir el error Offline -->
+    <!-- SDK Completo de Firebase (App, Auth y Firestore) -->
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -241,96 +242,55 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const firestoreProjectId = firebaseConfig.projectId;
+        const db = firebase.firestore();
 
-        // Genera la huella única de esta pestaña del navegador
+        // LA EVASIÓN AL "CLIENT IS OFFLINE": Obliga al SDK a usar HTTP (Long Polling) en vez de WebSockets.
+        db.settings({ experimentalForceLongPolling: true });
+
+        // Generador de Token Local Único del Navegador (La Huella Dactilar)
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
-        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO (VÍA REST API - INMUNE A OFFLINE/WEBSOCKETS) ---
+        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO ---
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
             const errorDiv = document.getElementById('login-error');
-            
+
             if (user) {
                 try {
-                    // Forzamos actualización del token de seguridad
-                    const idToken = await user.getIdToken(true);
-                    
-                    // Endpoint REST API directo a Firestore
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
-                    
-                    // 1. LEER EL ESTADO ACTUAL EN LA NUBE
-                    const getRes = await fetch(docUrl, {
-                        method: 'GET',
-                        headers: { 'Authorization': `Bearer ${idToken}` }
-                    });
+                    const userRef = db.collection("users").doc(user.uid);
+                    // source: 'server' fuerza a preguntar a la nube real, ignorando caché.
+                    const docSnap = await userRef.get({ source: 'server' });
 
-                    let activeSession = false;
-                    let dbToken = "";
-                    let docExists = false;
+                    if (docSnap.exists) {
+                        const data = docSnap.data();
 
-                    if (getRes.ok) {
-                        docExists = true;
-                        const data = await getRes.json();
-                        activeSession = data.fields?.activeSession?.booleanValue || false;
-                        dbToken = data.fields?.sessionToken?.stringValue || "";
-                    } else if (getRes.status === 404) {
-                        // El documento del usuario específico aún no existe (Usuario Nuevo). Lo crearemos en el paso 3.
-                        docExists = false;
-                    } else {
-                        const errText = await getRes.text();
-                        throw new Error(`Fallo de lectura HTTP ${getRes.status}: ${errText}`);
-                    }
-                    
-                    // 2. REGLA ESTRICTA DE LUIS PEREZ Y SU HIJO
-                    if (activeSession === true && dbToken !== localToken) {
-                        errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra ventana o dispositivo. Se permite un único acceso a la vez.";
-                        errorDiv.classList.remove('hidden');
-                        await auth.signOut();
-                        return; // Expulsión inmediata
-                    }
-
-                    // 3. ASEGURAR Y SELLAR LA BÓVEDA CON TU HUELLA
-                    let patchUrl = docUrl;
-                    if (docExists) {
-                        patchUrl += "?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken";
-                    }
-
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: true },
-                            sessionToken: { stringValue: localToken }
+                        // REGLA: Si la sesión está activa y el token NO es el de este navegador -> Expulsión.
+                        if (data.activeSession === true && data.sessionToken !== localToken) {
+                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. Se permite un único acceso a la vez.";
+                            errorDiv.classList.remove('hidden');
+                            await auth.signOut();
+                            return;
                         }
-                    };
-
-                    const patchRes = await fetch(patchUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (!patchRes.ok) {
-                        const errText = await patchRes.text();
-                        throw new Error(`El sistema rechazó el sello de seguridad: ${errText}`);
                     }
 
-                    // 4. ACCESO CONCEDIDO Y LIMPIO
+                    // ACCESO PERMITIDO: Sella la bóveda con tu huella.
+                    await userRef.set({
+                        activeSession: true,
+                        sessionToken: localToken
+                    }, { merge: true });
+
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
-                    
+
                 } catch (error) {
-                    errorDiv.innerText = "Error en el protocolo de conexión: " + error.message;
+                    errorDiv.innerText = "Error crítico de conexión con Firestore: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
@@ -346,7 +306,7 @@
             const password = document.getElementById('login-password').value;
             const errorDiv = document.getElementById('login-error');
             errorDiv.classList.add('hidden');
-            
+
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
@@ -358,56 +318,24 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // Cierre manual: libera la base de datos para que otra persona pueda entrar
-                    const idToken = await auth.currentUser.getIdToken(false);
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: false },
-                            sessionToken: { stringValue: "" }
-                        }
-                    };
-
-                    await fetch(docUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
+                    await db.collection("users").doc(auth.currentUser.uid).set({
+                        activeSession: false,
+                        sessionToken: ""
+                    }, { merge: true });
                 } catch (error) {
-                    console.error("Fallo al liberar cuenta en la red:", error);
+                    console.error("Fallo de red al liberar candado:", error);
                 }
             }
             auth.signOut();
         }
 
-        // Sistema Preventivo: Si se cierra la pestaña bruscamente, el 'keepalive' asegura que el paquete 
-        // HTTP llegue a Google Cloud para liberar la cuenta.
+        // Sistema Preventivo: Si se cierra la pestaña bruscamente
         window.addEventListener('beforeunload', () => {
             if (auth.currentUser) {
-                auth.currentUser.getIdToken(false).then(idToken => {
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: false },
-                            sessionToken: { stringValue: "" }
-                        }
-                    };
-                    fetch(docUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload),
-                        keepalive: true
-                    }).catch(() => {});
-                }).catch(() => {});
+                db.collection("users").doc(auth.currentUser.uid).set({
+                    activeSession: false,
+                    sessionToken: ""
+                }, { merge: true });
             }
         });
 
