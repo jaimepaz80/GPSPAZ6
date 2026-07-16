@@ -7,10 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     
-    <!-- SDK Completo de Firebase (App, Auth y Firestore) -->
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -236,65 +234,95 @@
           projectId: "gpsj-6790c",
           storageBucket: "gpsj-6790c.firebasestorage.app",
           messagingSenderId: "558545141519",
-          appId: "1:558545141519:web:d21e7360d54db4d84d887a",
-          measurementId: "G-3BQNVX74RS"
+          appId: "1:558545141519:web:d21e7360d54db4d84d887a"
         };
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const db = firebase.firestore();
 
-        // LA EVASIÓN AL "CLIENT IS OFFLINE": Obliga al SDK a usar HTTP (Long Polling) en vez de WebSockets.
-        db.settings({ experimentalForceLongPolling: true });
-
-        // Generador de Token Local Único del Navegador (La Huella Dactilar)
+        // 1. GENERADOR DE HUELLA DACTILAR DEL DISPOSITIVO
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
-        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO ---
-        auth.onAuthStateChanged(async (user) => {
-            const loginContainer = document.getElementById('login-container');
-            const appContainer = document.getElementById('app-container');
-            const errorDiv = document.getElementById('login-error');
+        let heartbeatTimer = null;
 
-            if (user) {
+        // 2. MOTOR DE LATIDO (HEARTBEAT) - Mantiene la sesión viva
+        async function startSessionHeartbeat(user) {
+            const beat = async () => {
                 try {
-                    const userRef = db.collection("users").doc(user.uid);
-                    // source: 'server' fuerza a preguntar a la nube real, ignorando caché.
-                    const docSnap = await userRef.get({ source: 'server' });
-
-                    if (docSnap.exists) {
-                        const data = docSnap.data();
-
-                        // REGLA: Si la sesión está activa y el token NO es el de este navegador -> Expulsión.
-                        if (data.activeSession === true && data.sessionToken !== localToken) {
-                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. Se permite un único acceso a la vez.";
-                            errorDiv.classList.remove('hidden');
-                            await auth.signOut();
+                    await user.reload(); // Obliga a leer el dato real desde el servidor de Google
+                    const currentData = user.displayName;
+                    
+                    if (currentData) {
+                        const parts = currentData.split("_");
+                        // Si el token que está en la nube ya no es el nuestro, alguien más tomó la sesión.
+                        if (parts.length === 2 && parts[1] !== localToken) {
+                            stopSessionHeartbeat();
+                            alert("SESIÓN FINALIZADA: Se ha iniciado sesión en otro dispositivo. Por seguridad, esta ventana se cerrará.");
+                            window.location.reload(); 
                             return;
                         }
                     }
 
-                    // ACCESO PERMITIDO: Sella la bóveda con tu huella.
-                    await userRef.set({
-                        activeSession: true,
-                        sessionToken: localToken
-                    }, { merge: true });
+                    // Escribir en el perfil: "Estoy vivo en este momento" + mi huella local
+                    const payload = Date.now() + "_" + localToken;
+                    await user.updateProfile({ displayName: payload });
+                } catch (e) {
+                    // Silenciar errores temporales de red para no molestar la ejecución
+                }
+            };
+            await beat(); // Latir inmediatamente al entrar
+            heartbeatTimer = setInterval(beat, 45000); // Latir cada 45 segundos
+        }
 
-                    loginContainer.classList.add('hidden');
-                    appContainer.classList.remove('hidden');
-                    errorDiv.innerText = "";
-                    document.getElementById('login-form').reset();
+        function stopSessionHeartbeat() {
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+        }
 
-                } catch (error) {
-                    errorDiv.innerText = "Error crítico de conexión con Firestore: " + error.message;
+        // 3. CONTROL CENTRAL DE SESIONES (LA REGLA DE LUIS Y SU HIJO)
+        auth.onAuthStateChanged(async (user) => {
+            const loginContainer = document.getElementById('login-container');
+            const appContainer = document.getElementById('app-container');
+            const errorDiv = document.getElementById('login-error');
+            
+            if (user) {
+                const currentData = user.displayName; 
+                let isLockedOut = false;
+
+                if (currentData) {
+                    const parts = currentData.split("_");
+                    if (parts.length === 2) {
+                        const lastBeat = parseInt(parts[0]);
+                        const activeToken = parts[1];
+                        const timeSinceLastBeat = Date.now() - lastBeat;
+
+                        // REGLA MATEMÁTICA: Si el token guardado es diferente al de esta computadora Y han pasado menos de 90 segundos desde el último latido...
+                        // Significa que Luis (el primer dispositivo) está activo ahora mismo. Bloqueamos al hijo.
+                        if (activeToken !== localToken && timeSinceLastBeat < 90000) {
+                            isLockedOut = true;
+                        }
+                    }
+                }
+
+                if (isLockedOut) {
+                    errorDiv.innerText = "ACCESO DENEGADO: El usuario ya está activo en otro dispositivo al mismo tiempo. Si se cerró la otra pantalla bruscamente, espere 2 minutos para que el candado caduque.";
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
+                    return; // Expulsión fulminante
                 }
+
+                // SI PASA EL FILTRO: Entramos y empezamos a latir
+                startSessionHeartbeat(user);
+
+                loginContainer.classList.add('hidden');
+                appContainer.classList.remove('hidden');
+                errorDiv.innerText = "";
+                document.getElementById('login-form').reset();
             } else {
+                stopSessionHeartbeat();
                 appContainer.classList.add('hidden');
                 loginContainer.classList.remove('hidden');
             }
@@ -306,38 +334,25 @@
             const password = document.getElementById('login-password').value;
             const errorDiv = document.getElementById('login-error');
             errorDiv.classList.add('hidden');
-
+            
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Error de ingreso: " + error.message;
+                errorDiv.innerText = "Error: " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
 
         async function cerrarSesion() {
             if (auth.currentUser) {
+                stopSessionHeartbeat();
                 try {
-                    await db.collection("users").doc(auth.currentUser.uid).set({
-                        activeSession: false,
-                        sessionToken: ""
-                    }, { merge: true });
-                } catch (error) {
-                    console.error("Fallo de red al liberar candado:", error);
-                }
+                    // Borramos la huella inmediatamente para que el hijo pueda entrar sin esperar los 2 minutos
+                    await auth.currentUser.updateProfile({ displayName: "" });
+                } catch (error) {}
             }
             auth.signOut();
         }
-
-        // Sistema Preventivo: Si se cierra la pestaña bruscamente
-        window.addEventListener('beforeunload', () => {
-            if (auth.currentUser) {
-                db.collection("users").doc(auth.currentUser.uid).set({
-                    activeSession: false,
-                    sessionToken: ""
-                }, { merge: true });
-            }
-        });
 
         function switchTab(num) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -486,4 +501,3 @@
     </script>
 </body>
 </html>
-
