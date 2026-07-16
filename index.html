@@ -9,7 +9,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -241,19 +240,16 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const db = firebase.firestore(); 
+        const firestoreProjectId = firebaseConfig.projectId; // Extraído para la API REST
 
-        // ESTA ES LA INYECCIÓN QUE RESUELVE EL "CLIENT IS OFFLINE". Fuerza HTTP en lugar de WebSockets.
-        db.settings({ experimentalForceLongPolling: true });
-
-        // Generador de Token Local Único del Navegador (La Huella Dactilar de esta pestaña)
+        // Genera la huella única de esta pestaña del navegador
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
-        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO (CASO LUIS PÉREZ) ---
+        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO (VÍA REST API - INMUNE A OFFLINE/WEBSOCKETS) ---
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
@@ -261,37 +257,78 @@
             
             if (user) {
                 try {
-                    const userRef = db.collection("users").doc(user.uid);
-                    // Agregamos { source: 'server' } para ignorar la caché local y preguntar directo a la nube.
-                    const docSnap = await userRef.get({ source: 'server' });
+                    // Forzamos actualización del token de seguridad para asegurar conexión fresca
+                    const idToken = await user.getIdToken(true);
+                    
+                    // Endpoint REST API directo a Firestore (Ignorando fallos de red WebSockets)
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
+                    
+                    // 1. LEER EL ESTADO ACTUAL EN LA NUBE
+                    const getRes = await fetch(docUrl, {
+                        method: 'GET',
+                        headers: { 'Authorization': `Bearer ${idToken}` }
+                    });
 
-                    if (docSnap.exists) {
-                        const data = docSnap.data();
-                        
-                        // REGLA: Si Luis Pérez (Padre) está conectado, activeSession es true y tiene su token.
-                        // Si el Hijo intenta entrar, su localToken será distinto. El sistema lo expulsa.
-                        if (data.activeSession === true && data.sessionToken !== localToken) {
-                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. El usuario que está adentro debe cerrar sesión primero.";
-                            errorDiv.classList.remove('hidden');
-                            await auth.signOut();
-                            return;
-                        }
+                    let activeSession = false;
+                    let dbToken = "";
+                    let docExists = false;
+
+                    if (getRes.ok) {
+                        docExists = true;
+                        const data = await getRes.json();
+                        // Estructura de respuesta estricta de la API REST de Google
+                        activeSession = data.fields?.activeSession?.booleanValue || false;
+                        dbToken = data.fields?.sessionToken?.stringValue || "";
+                    } else if (getRes.status !== 404) {
+                        const errText = await getRes.text();
+                        throw new Error(`Fallo de lectura HTTP ${getRes.status}: ${errText}`);
+                    }
+                    
+                    // 2. REGLA ESTRICTA DE LUIS PEREZ Y SU HIJO
+                    if (activeSession === true && dbToken !== localToken) {
+                        errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra ventana o dispositivo. Se permite un único acceso a la vez.";
+                        errorDiv.classList.remove('hidden');
+                        await auth.signOut();
+                        return; // Expulsión inmediata
                     }
 
-                    // ACCESO PERMITIDO: Eres el primero en entrar (o entras desde la misma pestaña donde estabas).
-                    // Se sella la bóveda con tu token para que nadie más entre.
-                    await userRef.set({
-                        activeSession: true,
-                        sessionToken: localToken
-                    }, { merge: true });
+                    // 3. ASEGURAR Y SELLAR LA BÓVEDA CON TU HUELLA
+                    let patchUrl = docUrl;
+                    if (docExists) {
+                        // Respetamos otras variables de la BD, solo sobreescribimos sesión
+                        patchUrl += "?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken";
+                    }
 
+                    const payload = {
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: true },
+                            sessionToken: { stringValue: localToken }
+                        }
+                    };
+
+                    const patchRes = await fetch(patchUrl, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!patchRes.ok) {
+                        const errText = await patchRes.text();
+                        throw new Error(`El sistema rechazó el sello de seguridad: ${errText}`);
+                    }
+
+                    // 4. ACCESO CONCEDIDO Y LIMPIO
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
                     
                 } catch (error) {
-                    errorDiv.innerText = "Error crítico de conexión con Firebase: " + error.message;
+                    errorDiv.innerText = "Error en el protocolo de conexión: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
@@ -311,7 +348,7 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Error: Credenciales incorrectas o falla de autenticación. " + error.message;
+                errorDiv.innerText = "Error de ingreso: " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
@@ -319,28 +356,56 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // Luis Pérez padre hace clic en Cerrar Sesión. 
-                    // El sistema cambia activeSession a false. Ahora el hijo podrá entrar.
-                    await db.collection("users").doc(auth.currentUser.uid).set({
-                        activeSession: false,
-                        sessionToken: ""
-                    }, { merge: true });
+                    // Cierre manual: libera la base de datos para que otra persona (o tú en otra PC) pueda entrar
+                    const idToken = await auth.currentUser.getIdToken(false);
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
+                    
+                    const payload = {
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: false },
+                            sessionToken: { stringValue: "" }
+                        }
+                    };
+
+                    await fetch(docUrl, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
                 } catch (error) {
-                    console.error("Fallo de red al liberar candado:", error);
+                    console.error("Fallo al liberar cuenta en la red:", error);
                 }
             }
             auth.signOut();
         }
 
-        // --- SISTEMA PREVENTIVO ANTI-BLOQUEO ---
-        // Si el operador cierra la pestaña abruptamente sin hacer clic en "Cerrar Sesión", 
-        // disparamos la liberación de la sesión para no dejar a Luis bloqueado permanentemente.
+        // Sistema Preventivo: Si se cierra la pestaña bruscamente, el 'keepalive' asegura que el paquete 
+        // HTTP llegue a Google Cloud para liberar la cuenta, evitando que te quedes bloqueado por siempre.
         window.addEventListener('beforeunload', () => {
             if (auth.currentUser) {
-                db.collection("users").doc(auth.currentUser.uid).set({
-                    activeSession: false,
-                    sessionToken: ""
-                }, { merge: true });
+                auth.currentUser.getIdToken(false).then(idToken => {
+                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
+                    const payload = {
+                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: false },
+                            sessionToken: { stringValue: "" }
+                        }
+                    };
+                    fetch(docUrl, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload),
+                        keepalive: true
+                    }).catch(() => {});
+                }).catch(() => {});
             }
         });
 
@@ -491,4 +556,3 @@
     </script>
 </body>
 </html>
-
