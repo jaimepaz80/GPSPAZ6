@@ -9,7 +9,6 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -235,21 +234,19 @@
           projectId: "gpsj-6790c",
           storageBucket: "gpsj-6790c.firebasestorage.app",
           messagingSenderId: "558545141519",
-          appId: "1:558545141519:web:d21e7360d54db4d84d887a",
-          measurementId: "G-3BQNVX74RS"
+          appId: "1:558545141519:web:d21e7360d54db4d84d887a"
         };
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const db = firebase.firestore();
         
-        // Forzar Long-Polling para mitigar bloqueos de WebSocket y evitar el error "client is offline"
-        db.settings({
-            experimentalForceLongPolling: true,
-            useFetchStreams: false
-        });
-        
-        let checkingSession = false;
+        // Identificador único de este navegador. 
+        // Permite saber si "quien entra" es el mismo dispositivo de la sesión activa o uno ajeno.
+        let localToken = localStorage.getItem('gnssjp_token');
+        if (!localToken) {
+            localToken = Date.now().toString() + Math.random().toString(36).substring(2);
+            localStorage.setItem('gnssjp_token', localToken);
+        }
 
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
@@ -257,61 +254,73 @@
             const errorDiv = document.getElementById('login-error');
             
             if (user) {
-                if (checkingSession) return;
-                checkingSession = true;
-                
-                const userRef = db.collection('users').doc(user.uid);
-                let doc = null;
-                let intentos = 0;
-                
-                // Bucle de tolerancia para asegurar la conexión inicial de Firestore en redes móviles
-                while (intentos < 3) {
-                    try {
-                        doc = await userRef.get();
-                        break;
-                    } catch (err) {
-                        intentos++;
-                        if (intentos >= 3) {
-                            errorDiv.innerText = "Error de conexión a la base de datos: " + err.message;
-                            errorDiv.classList.remove('hidden');
-                            await auth.signOut();
-                            checkingSession = false;
-                            return;
-                        }
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-                }
-                
-                if (doc && doc.exists) {
-                    const data = doc.data();
-                    // REGLA ESTRICTA: Si la sesión ya está activa en la base de datos, bloquear el ingreso de inmediato
-                    if (data && data.activeSession === true) {
-                        errorDiv.innerText = "Acceso Denegado: Este usuario ya tiene una sesión activa en otro dispositivo.";
+                try {
+                    // Generamos Token de Autorización de Firebase
+                    const idToken = await user.getIdToken();
+                    
+                    // URL de la API REST oficial de Google Firestore para consultar al usuario
+                    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${user.uid}`;
+                    
+                    // 1. LEER EL ESTADO ACTUAL DE LA BASE DE DATOS
+                    const getResponse = await fetch(url, {
+                        method: 'GET',
+                        headers: { 'Authorization': `Bearer ${idToken}` }
+                    });
+
+                    let activeSession = false;
+                    let dbToken = "";
+
+                    if (getResponse.ok) {
+                        const data = await getResponse.json();
+                        activeSession = data.fields?.activeSession?.booleanValue || false;
+                        dbToken = data.fields?.sessionToken?.stringValue || "";
+                    } 
+                    
+                    // 2. APLICAR SU REGLA: Si la sesión está activa y NO eres el mismo dispositivo, BLOQUEO DEFINITIVO
+                    if (activeSession === true && dbToken !== localToken) {
+                        errorDiv.innerText = "ACCESO DENEGADO: El usuario está en uso en otro dispositivo. El operador activo debe cerrar sesión para liberar la cuenta.";
                         errorDiv.classList.remove('hidden');
                         await auth.signOut();
-                        checkingSession = false;
-                        return;
+                        return; // Expulsado
                     }
-                }
-                
-                // El primer dispositivo bloquea el acceso estableciendo activeSession en true
-                try {
-                    await userRef.set({ activeSession: true }, { merge: true });
+
+                    // 3. SI EL ACCESO ES PERMITIDO, SOBREESCRIBIR LA BASE DE DATOS (UPSERT)
+                    // Actualizamos para decirle al sistema "Yo estoy activo ahora y este es mi identificador"
+                    const payload = {
+                        name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${user.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: true },
+                            sessionToken: { stringValue: localToken }
+                        }
+                    };
+
+                    const patchResponse = await fetch(url, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!patchResponse.ok) {
+                        throw new Error("No se pudo escribir en Firestore.");
+                    }
+
+                    // Éxito: Mostrar Aplicación
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
-                } catch (err) {
-                    errorDiv.innerText = "Error al registrar la sesión: " + err.message;
+                    
+                } catch (error) {
+                    errorDiv.innerText = "Error crítico de conexión segura: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
-                
-                checkingSession = false;
             } else {
                 appContainer.classList.add('hidden');
                 loginContainer.classList.remove('hidden');
-                checkingSession = false;
             }
         });
 
@@ -325,19 +334,36 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Error: " + error.message;
+                errorDiv.innerText = "Credenciales incorrectas: " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
 
         async function cerrarSesion() {
             if (auth.currentUser) {
-                const userRef = db.collection('users').doc(auth.currentUser.uid);
                 try {
-                    // Libera la sesión de forma exclusiva únicamente al pulsar el botón
-                    await userRef.update({ activeSession: false });
+                    // Al presionar el botón, liberamos la base de datos para que el usuario B sí pueda entrar
+                    const idToken = await auth.currentUser.getIdToken();
+                    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${auth.currentUser.uid}`;
+                    
+                    const payload = {
+                        name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
+                        fields: {
+                            activeSession: { booleanValue: false },
+                            sessionToken: { stringValue: "" }
+                        }
+                    };
+
+                    await fetch(url, {
+                        method: 'PATCH',
+                        headers: {
+                            'Authorization': `Bearer ${idToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
                 } catch (error) {
-                    console.error("Error al liberar la sesión:", error);
+                    console.error("Fallo al liberar cuenta en Firebase:", error);
                 }
             }
             auth.signOut();
