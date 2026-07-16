@@ -9,6 +9,7 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -234,98 +235,83 @@
           projectId: "gpsj-6790c",
           storageBucket: "gpsj-6790c.firebasestorage.app",
           messagingSenderId: "558545141519",
-          appId: "1:558545141519:web:d21e7360d54db4d84d887a"
+          appId: "1:558545141519:web:d21e7360d54db4d84d887a",
+          measurementId: "G-3BQNVX74RS"
         };
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const firestoreProjectId = firebaseConfig.projectId;
+        const db = firebase.firestore();
         
-        let localSessionToken = null;
+        // Forzar Long-Polling para mitigar bloqueos de WebSocket y evitar el error "client is offline"
+        db.settings({
+            experimentalForceLongPolling: true,
+            useFetchStreams: false
+        });
+        
+        let checkingSession = false;
 
-        // LÓGICA ESTRICTA Y COMUNICACIÓN VÍA API REST PURA (Bypass de errores de red del SDK)
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
             const errorDiv = document.getElementById('login-error');
             
             if (user) {
-                try {
-                    // 1. Obtener Token de Seguridad de Auth
-                    const idToken = await user.getIdToken(true);
-                    
-                    // 2. Construir la URL de la API REST de Firestore
-                    const url = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
-                    
-                    let activeSession = false;
-                    let dbToken = null;
-
-                    // 3. Consultar la base de datos vía HTTPS estándar (Nunca fallará por WebSockets)
-                    const getResponse = await fetch(url, {
-                        method: 'GET',
-                        headers: { 'Authorization': `Bearer ${idToken}` }
-                    });
-
-                    if (getResponse.ok) {
-                        const docData = await getResponse.json();
-                        if (docData.fields) {
-                            activeSession = docData.fields.activeSession?.booleanValue || false;
-                            dbToken = docData.fields.sessionToken?.stringValue || null;
+                if (checkingSession) return;
+                checkingSession = true;
+                
+                const userRef = db.collection('users').doc(user.uid);
+                let doc = null;
+                let intentos = 0;
+                
+                // Bucle de tolerancia para asegurar la conexión inicial de Firestore en redes móviles
+                while (intentos < 3) {
+                    try {
+                        doc = await userRef.get();
+                        break;
+                    } catch (err) {
+                        intentos++;
+                        if (intentos >= 3) {
+                            errorDiv.innerText = "Error de conexión a la base de datos: " + err.message;
+                            errorDiv.classList.remove('hidden');
+                            await auth.signOut();
+                            checkingSession = false;
+                            return;
                         }
-                    } else if (getResponse.status !== 404) {
-                        throw new Error("HTTP Error " + getResponse.status);
+                        await new Promise(r => setTimeout(r, 1000));
                     }
-
-                    // 4. Lógica de Bloqueo Estricto
-                    if (activeSession === true && dbToken !== localSessionToken) {
-                        errorDiv.innerText = "Acceso Denegado: La cuenta está en uso activo. El operador anterior debe cerrar sesión.";
+                }
+                
+                if (doc && doc.exists) {
+                    const data = doc.data();
+                    // REGLA ESTRICTA: Si la sesión ya está activa en la base de datos, bloquear el ingreso de inmediato
+                    if (data && data.activeSession === true) {
+                        errorDiv.innerText = "Acceso Denegado: Este usuario ya tiene una sesión activa en otro dispositivo.";
                         errorDiv.classList.remove('hidden');
                         await auth.signOut();
+                        checkingSession = false;
                         return;
                     }
-
-                    // 5. Asignar token único local
-                    if (!localSessionToken) {
-                        localSessionToken = Date.now().toString();
-                    }
-
-                    // 6. Bloquear la sesión en la base de datos vía API REST
-                    const patchUrl = `${url}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    const payload = {
-                        fields: {
-                            activeSession: { booleanValue: true },
-                            sessionToken: { stringValue: localSessionToken }
-                        }
-                    };
-
-                    const patchResponse = await fetch(patchUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (!patchResponse.ok) {
-                        throw new Error("No se pudo escribir el estado de la sesión.");
-                    }
-
-                    // 7. Acceso Permitido
+                }
+                
+                // El primer dispositivo bloquea el acceso estableciendo activeSession en true
+                try {
+                    await userRef.set({ activeSession: true }, { merge: true });
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
-                    
-                } catch (error) {
-                    errorDiv.innerText = "Fallo de conexión REST: " + error.message;
+                } catch (err) {
+                    errorDiv.innerText = "Error al registrar la sesión: " + err.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
+                
+                checkingSession = false;
             } else {
                 appContainer.classList.add('hidden');
                 loginContainer.classList.remove('hidden');
-                localSessionToken = null;
+                checkingSession = false;
             }
         });
 
@@ -339,35 +325,19 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Credenciales incorrectas o error de inicio: " + error.message;
+                errorDiv.innerText = "Error: " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
 
         async function cerrarSesion() {
             if (auth.currentUser) {
+                const userRef = db.collection('users').doc(auth.currentUser.uid);
                 try {
-                    // Liberar la sesión vía API REST pura
-                    const idToken = await auth.currentUser.getIdToken();
-                    const url = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    
-                    const payload = {
-                        fields: {
-                            activeSession: { booleanValue: false },
-                            sessionToken: { stringValue: "" }
-                        }
-                    };
-
-                    await fetch(url, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
+                    // Libera la sesión de forma exclusiva únicamente al pulsar el botón
+                    await userRef.update({ activeSession: false });
                 } catch (error) {
-                    console.error("Error al liberar sesión:", error);
+                    console.error("Error al liberar la sesión:", error);
                 }
             }
             auth.signOut();
