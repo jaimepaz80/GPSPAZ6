@@ -7,6 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     
+    <!-- SDK de Firebase: Solo App y Auth. Firestore se maneja vía REST API pura para evadir el error Offline -->
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
 
@@ -240,7 +241,7 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const firestoreProjectId = firebaseConfig.projectId; // Extraído para la API REST
+        const firestoreProjectId = firebaseConfig.projectId;
 
         // Genera la huella única de esta pestaña del navegador
         let localToken = localStorage.getItem('gnssjp_token');
@@ -257,10 +258,10 @@
             
             if (user) {
                 try {
-                    // Forzamos actualización del token de seguridad para asegurar conexión fresca
+                    // Forzamos actualización del token de seguridad
                     const idToken = await user.getIdToken(true);
                     
-                    // Endpoint REST API directo a Firestore (Ignorando fallos de red WebSockets)
+                    // Endpoint REST API directo a Firestore
                     const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
                     
                     // 1. LEER EL ESTADO ACTUAL EN LA NUBE
@@ -276,10 +277,12 @@
                     if (getRes.ok) {
                         docExists = true;
                         const data = await getRes.json();
-                        // Estructura de respuesta estricta de la API REST de Google
                         activeSession = data.fields?.activeSession?.booleanValue || false;
                         dbToken = data.fields?.sessionToken?.stringValue || "";
-                    } else if (getRes.status !== 404) {
+                    } else if (getRes.status === 404) {
+                        // El documento del usuario específico aún no existe (Usuario Nuevo). Lo crearemos en el paso 3.
+                        docExists = false;
+                    } else {
                         const errText = await getRes.text();
                         throw new Error(`Fallo de lectura HTTP ${getRes.status}: ${errText}`);
                     }
@@ -295,7 +298,6 @@
                     // 3. ASEGURAR Y SELLAR LA BÓVEDA CON TU HUELLA
                     let patchUrl = docUrl;
                     if (docExists) {
-                        // Respetamos otras variables de la BD, solo sobreescribimos sesión
                         patchUrl += "?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken";
                     }
 
@@ -356,7 +358,7 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // Cierre manual: libera la base de datos para que otra persona (o tú en otra PC) pueda entrar
+                    // Cierre manual: libera la base de datos para que otra persona pueda entrar
                     const idToken = await auth.currentUser.getIdToken(false);
                     const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
                     
@@ -384,7 +386,7 @@
         }
 
         // Sistema Preventivo: Si se cierra la pestaña bruscamente, el 'keepalive' asegura que el paquete 
-        // HTTP llegue a Google Cloud para liberar la cuenta, evitando que te quedes bloqueado por siempre.
+        // HTTP llegue a Google Cloud para liberar la cuenta.
         window.addEventListener('beforeunload', () => {
             if (auth.currentUser) {
                 auth.currentUser.getIdToken(false).then(idToken => {
@@ -556,3 +558,4 @@
     </script>
 </body>
 </html>
+
