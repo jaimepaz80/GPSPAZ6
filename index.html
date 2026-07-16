@@ -9,6 +9,7 @@
     
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 
     <style>
         .console { font-family: 'Courier New', Courier, monospace; background-color: #050505; color: #00ff33; white-space: pre-wrap; }
@@ -234,21 +235,22 @@
           projectId: "gpsj-6790c",
           storageBucket: "gpsj-6790c.firebasestorage.app",
           messagingSenderId: "558545141519",
-          appId: "1:558545141519:web:d21e7360d54db4d84d887a"
+          appId: "1:558545141519:web:d21e7360d54db4d84d887a",
+          measurementId: "G-3BQNVX74RS"
         };
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const firestoreProjectId = firebaseConfig.projectId;
-        
-        // Genera un identificador único local del navegador. Si entras desde otro lado, este código será distinto.
+        const db = firebase.firestore(); // Invocación de base de datos Vía SDK Nativo
+
+        // Generador de Token Local Único del Navegador
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
-        // SISTEMA DE CONTROL DE SESIÓN VÍA API REST PURA
+        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO ---
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
@@ -256,74 +258,33 @@
             
             if (user) {
                 try {
-                    const idToken = await user.getIdToken();
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`;
-                    
-                    // PASO 1: LEER EL ESTADO ACTUAL DE FORMA SEGURA (HTTP NORMAL)
-                    const getRes = await fetch(docUrl, {
-                        method: 'GET',
-                        headers: { 'Authorization': `Bearer ${idToken}` }
-                    });
+                    const userRef = db.collection("users").doc(user.uid);
+                    const docSnap = await userRef.get();
 
-                    let activeSession = false;
-                    let dbToken = "";
-                    let docExists = false;
-
-                    if (getRes.ok) {
-                        docExists = true;
-                        const data = await getRes.json();
-                        activeSession = data.fields?.activeSession?.booleanValue || false;
-                        dbToken = data.fields?.sessionToken?.stringValue || "";
-                    } else if (getRes.status !== 404) {
-                        const errText = await getRes.text();
-                        throw new Error(`Fallo de lectura de base de datos (${getRes.status}): ${errText}`);
-                    }
-                    
-                    // PASO 2: APLICACIÓN DE SU REGLA ESTRICTA DE BLOQUEO
-                    if (activeSession === true && dbToken !== localToken) {
-                        errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está abierto en otra computadora, teléfono o tablet. Debe cerrar sesión allí primero para poder ingresar.";
-                        errorDiv.classList.remove('hidden');
-                        await auth.signOut();
-                        return; // Expulsión inmediata
-                    }
-
-                    // PASO 3: ASEGURAR Y BLOQUEAR LA CUENTA PARA QUE NADIE MÁS ENTRE
-                    let patchUrl = docUrl;
-                    if (docExists) {
-                        // Si el documento ya existe, usamos updateMask para NO borrar su lista de teléfonos
-                        patchUrl += "?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken";
-                    }
-
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${user.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: true },
-                            sessionToken: { stringValue: localToken }
+                    if (docSnap.exists) {
+                        const data = docSnap.data();
+                        // REGLA: Si la sesión está activa y el token NO es el de esta pestaña -> Expulsión.
+                        if (data.activeSession === true && data.sessionToken !== localToken) {
+                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. Cierre sesión allí primero.";
+                            errorDiv.classList.remove('hidden');
+                            await auth.signOut();
+                            return;
                         }
-                    };
-
-                    const patchRes = await fetch(patchUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (!patchRes.ok) {
-                        const errText = await patchRes.text();
-                        throw new Error(`El sistema protegió su cuenta y rechazó la sobre-escritura (${patchRes.status}): ${errText}`);
                     }
 
-                    // PASO 4: ACCESO CONCEDIDO CON ÉXITO
+                    // ACCESO PERMITIDO: El usuario es el dueño legítimo, aseguramos la bóveda.
+                    await userRef.set({
+                        activeSession: true,
+                        sessionToken: localToken
+                    }, { merge: true });
+
                     loginContainer.classList.add('hidden');
                     appContainer.classList.remove('hidden');
                     errorDiv.innerText = "";
                     document.getElementById('login-form').reset();
                     
                 } catch (error) {
-                    errorDiv.innerText = "Error en el protocolo de seguridad: " + error.message;
+                    errorDiv.innerText = "Error crítico de seguridad de base de datos: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
@@ -343,7 +304,7 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Error de ingreso: " + error.message;
+                errorDiv.innerText = "Error: Credenciales incorrectas o red caída. " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
@@ -351,32 +312,29 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // Solo cuando hace clic aquí, el sistema libera su cuenta para que otro dispositivo entre
-                    const idToken = await auth.currentUser.getIdToken();
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: false },
-                            sessionToken: { stringValue: "" }
-                        }
-                    };
-
-                    await fetch(docUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload)
-                    });
+                    // El operador hace clic manual: liberamos su candado en la nube.
+                    await db.collection("users").doc(auth.currentUser.uid).set({
+                        activeSession: false,
+                        sessionToken: ""
+                    }, { merge: true });
                 } catch (error) {
-                    console.error("Fallo al liberar cuenta en Firebase:", error);
+                    console.error("Fallo de red al liberar candado:", error);
                 }
             }
             auth.signOut();
         }
+
+        // --- SISTEMA PREVENTIVO ANTI-BLOQUEO ---
+        // Si se corta la luz, se crashea el teléfono o cierras la pestaña abruptamente, 
+        // disparamos la liberación de la sesión para que no quedes bloqueado para siempre.
+        window.addEventListener('beforeunload', () => {
+            if (auth.currentUser) {
+                db.collection("users").doc(auth.currentUser.uid).set({
+                    activeSession: false,
+                    sessionToken: ""
+                }, { merge: true });
+            }
+        });
 
         function switchTab(num) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -522,33 +480,6 @@
                 alert("Ocurrió un error al generar el PDF. Revisa la consola del navegador.");
             }
         }
-
-        // --- NUEVO MÓDULO DE LIBERACIÓN DE SESIÓN (PREVENCIÓN DE BLOQUEO PERMANENTE) ---
-        window.addEventListener('beforeunload', (event) => {
-            if (auth.currentUser) {
-                // Recupera el token en caché sin forzar recarga HTTP
-                auth.currentUser.getIdToken(false).then(idToken => {
-                    const docUrl = `https://firestore.googleapis.com/v1/projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}?updateMask.fieldPaths=activeSession&updateMask.fieldPaths=sessionToken`;
-                    const payload = {
-                        name: `projects/${firestoreProjectId}/databases/(default)/documents/users/${auth.currentUser.uid}`,
-                        fields: {
-                            activeSession: { booleanValue: false },
-                            sessionToken: { stringValue: "" }
-                        }
-                    };
-                    // El parámetro keepalive garantiza que Vercel/Firebase reciba el PATCH aunque el navegador se cierre abruptamente.
-                    fetch(docUrl, {
-                        method: 'PATCH',
-                        headers: {
-                            'Authorization': `Bearer ${idToken}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload),
-                        keepalive: true
-                    }).catch(() => {});
-                }).catch(() => {});
-            }
-        });
     </script>
 </body>
 </html>
