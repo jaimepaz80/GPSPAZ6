@@ -241,16 +241,19 @@
 
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
-        const db = firebase.firestore(); // Invocación de base de datos Vía SDK Nativo
+        const db = firebase.firestore(); 
 
-        // Generador de Token Local Único del Navegador
+        // ESTA ES LA INYECCIÓN QUE RESUELVE EL "CLIENT IS OFFLINE". Fuerza HTTP en lugar de WebSockets.
+        db.settings({ experimentalForceLongPolling: true });
+
+        // Generador de Token Local Único del Navegador (La Huella Dactilar de esta pestaña)
         let localToken = localStorage.getItem('gnssjp_token');
         if (!localToken) {
             localToken = Date.now().toString() + Math.random().toString(36).substring(2);
             localStorage.setItem('gnssjp_token', localToken);
         }
 
-        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO ---
+        // --- SISTEMA DE CONTROL DE SESIÓN ESTRICTO (CASO LUIS PÉREZ) ---
         auth.onAuthStateChanged(async (user) => {
             const loginContainer = document.getElementById('login-container');
             const appContainer = document.getElementById('app-container');
@@ -259,20 +262,24 @@
             if (user) {
                 try {
                     const userRef = db.collection("users").doc(user.uid);
-                    const docSnap = await userRef.get();
+                    // Agregamos { source: 'server' } para ignorar la caché local y preguntar directo a la nube.
+                    const docSnap = await userRef.get({ source: 'server' });
 
                     if (docSnap.exists) {
                         const data = docSnap.data();
-                        // REGLA: Si la sesión está activa y el token NO es el de esta pestaña -> Expulsión.
+                        
+                        // REGLA: Si Luis Pérez (Padre) está conectado, activeSession es true y tiene su token.
+                        // Si el Hijo intenta entrar, su localToken será distinto. El sistema lo expulsa.
                         if (data.activeSession === true && data.sessionToken !== localToken) {
-                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. Cierre sesión allí primero.";
+                            errorDiv.innerText = "ACCESO DENEGADO: Su usuario ya está activo en otra computadora o teléfono. El usuario que está adentro debe cerrar sesión primero.";
                             errorDiv.classList.remove('hidden');
                             await auth.signOut();
                             return;
                         }
                     }
 
-                    // ACCESO PERMITIDO: El usuario es el dueño legítimo, aseguramos la bóveda.
+                    // ACCESO PERMITIDO: Eres el primero en entrar (o entras desde la misma pestaña donde estabas).
+                    // Se sella la bóveda con tu token para que nadie más entre.
                     await userRef.set({
                         activeSession: true,
                         sessionToken: localToken
@@ -284,7 +291,7 @@
                     document.getElementById('login-form').reset();
                     
                 } catch (error) {
-                    errorDiv.innerText = "Error crítico de seguridad de base de datos: " + error.message;
+                    errorDiv.innerText = "Error crítico de conexión con Firebase: " + error.message;
                     errorDiv.classList.remove('hidden');
                     await auth.signOut();
                 }
@@ -304,7 +311,7 @@
             try {
                 await auth.signInWithEmailAndPassword(email, password);
             } catch (error) {
-                errorDiv.innerText = "Error: Credenciales incorrectas o red caída. " + error.message;
+                errorDiv.innerText = "Error: Credenciales incorrectas o falla de autenticación. " + error.message;
                 errorDiv.classList.remove('hidden');
             }
         }
@@ -312,7 +319,8 @@
         async function cerrarSesion() {
             if (auth.currentUser) {
                 try {
-                    // El operador hace clic manual: liberamos su candado en la nube.
+                    // Luis Pérez padre hace clic en Cerrar Sesión. 
+                    // El sistema cambia activeSession a false. Ahora el hijo podrá entrar.
                     await db.collection("users").doc(auth.currentUser.uid).set({
                         activeSession: false,
                         sessionToken: ""
@@ -325,8 +333,8 @@
         }
 
         // --- SISTEMA PREVENTIVO ANTI-BLOQUEO ---
-        // Si se corta la luz, se crashea el teléfono o cierras la pestaña abruptamente, 
-        // disparamos la liberación de la sesión para que no quedes bloqueado para siempre.
+        // Si el operador cierra la pestaña abruptamente sin hacer clic en "Cerrar Sesión", 
+        // disparamos la liberación de la sesión para no dejar a Luis bloqueado permanentemente.
         window.addEventListener('beforeunload', () => {
             if (auth.currentUser) {
                 db.collection("users").doc(auth.currentUser.uid).set({
@@ -483,3 +491,4 @@
     </script>
 </body>
 </html>
+
